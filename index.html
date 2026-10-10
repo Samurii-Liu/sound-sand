@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>声音沙画</title>
+<style>
+  :root {
+    --bg: #07070f;
+    --panel: rgba(20, 20, 36, 0.72);
+    --border: rgba(255, 255, 255, 0.10);
+    --text: #e8e6f5;
+    --muted: #8c89a8;
+    --accent: #9d8cff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: radial-gradient(ellipse at 50% 40%, #12122a 0%, var(--bg) 70%);
+    color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    user-select: none; -webkit-user-select: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+
+  .title {
+    position: fixed; top: 18px; left: 20px; pointer-events: none;
+  }
+  .title h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 2px; }
+  .title p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+
+  .hint {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    text-align: center; pointer-events: none; transition: opacity .8s;
+    color: var(--muted); font-size: 15px; line-height: 1.9;
+  }
+  .hint b { color: var(--text); font-weight: 500; }
+  .hint.gone { opacity: 0; }
+
+  .bar {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; align-items: center;
+    padding: 8px; max-width: calc(100vw - 24px);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  .group { display: flex; gap: 2px; padding: 2px; border-radius: 10px; background: rgba(255,255,255,0.04); }
+  .sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
+  button {
+    font: inherit; font-size: 13px; color: var(--muted);
+    background: transparent; border: 0; border-radius: 8px;
+    padding: 6px 10px; cursor: pointer; transition: background .15s, color .15s;
+  }
+  button:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+  button.on { color: #fff; background: rgba(157, 140, 255, 0.28); }
+  button:disabled { opacity: .4; cursor: default; }
+  kbd { font-size: 10px; opacity: .5; margin-left: 3px; font-family: inherit; }
+
+  @media (max-width: 640px) {
+    kbd { display: none; }
+    button { padding: 6px 8px; font-size: 12px; }
+    .sep { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="title">
+  <h1>声音沙画</h1>
+  <p>越高越亮，越快越响</p>
+</div>
+
+<div class="hint" id="hint">
+  <b>按住拖动来作画</b><br>
+  上下移动改变音高 · 左右移动改变声像<br>
+  可以多指同时画
+</div>
+
+<div class="bar">
+  <div class="group" id="scales"></div>
+  <div class="sep"></div>
+  <div class="group" id="timbres"></div>
+  <div class="sep"></div>
+  <button id="freeze" title="让笔迹不再消散">定格<kbd>F</kbd></button>
+  <button id="replay" title="重新播放这幅画">回放<kbd>␣</kbd></button>
+  <button id="clear">清空<kbd>C</kbd></button>
+  <button id="mute">静音<kbd>M</kbd></button>
+</div>
+
+<script>
+(() => {
+  // ---------- 音乐设置 ----------
+  const SCALES = [
+    { name: '五声', steps: [0, 2, 4, 7, 9] },
+    { name: '小调', steps: [0, 3, 5, 7, 10] },
+    { name: '都节', steps: [0, 1, 5, 7, 8] },
+    { name: '全音', steps: [0, 2, 4, 6, 8, 10] },
+  ];
+  const TIMBRES = [
+    { name: '玻璃', osc: 'triangle', decay: 1.6, bright: 1 },
+    { name: '柔和', osc: 'sine', decay: 2.2, bright: 0.6 },
+    { name: '合成', osc: 'sawtooth', decay: 0.9, bright: 0.45 },
+  ];
+  const NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+  const ROOT = 48, OCTAVES = 3;
+
+  let scaleIdx = 0, timbreIdx = 0, muted = false, frozen = false;
+  let notes = [];
+  function buildNotes() {
+    notes = [];
+    for (let o = 0; o < OCTAVES; o++)
+      for (const s of SCALES[scaleIdx].steps) notes.push(ROOT + o * 12 + s);
+    notes.push(ROOT + OCTAVES * 12);
+  }
+  buildNotes();
+  const midiToFreq = m => 440 * Math.pow(2, (m - 69) / 12);
+  const midiName = m => NAMES[m % 12] + (Math.floor(m / 12) - 1);
+
+  // ---------- 音频 ----------
+  let ac = null, master, dryBus, delayIn;
+  function initAudio() {
+    if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    const comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -18; comp.ratio.value = 4;
+    master = ac.createGain(); master.gain.value = muted ? 0 : 0.7;
+    master.connect(comp).connect(ac.destination);
+
+    dryBus = ac.createGain(); dryBus.connect(master);
+
+    // 带滤波的反馈延迟，制造回声
+    delayIn = ac.createGain(); delayIn.gain.value = 0.35;
+    const delay = ac.createDelay(1); delay.delayTime.value = 0.31;
+    const fb = ac.createGain(); fb.gain.value = 0.42;
+    const damp = ac.createBiquadFilter(); damp.type = 'lowpass'; damp.frequency.value = 2400;
+    delayIn.connect(delay); delay.connect(damp); damp.connect(fb); fb.connect(delay);
+    damp.connect(master);
+  }
+
+  function playNote(midi, vel, pan) {
+    if (!ac || muted) return;
+    const t = ac.currentTime, T = TIMBRES[timbreIdx], f = midiToFreq(midi);
+    const peak = 0.16 * (0.35 + 0.65 * vel);
+
+    const env = ac.createGain();
+    env.gain.setValueAtTime(0.0001, t);
+    env.gain.exponentialRampToValueAtTime(peak, t + 0.008);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + T.decay);
+
+    const filt = ac.createBiquadFilter();
+    filt.type = 'lowpass';
+    filt.frequency.setValueAtTime((900 + vel * 6000) * T.bright + f, t);
+    filt.frequency.exponentialRampToValueAtTime(Math.max(300, f * 1.5), t + T.decay);
+
+    const o1 = ac.createOscillator(); o1.type = T.osc; o1.frequency.value = f;
+    const o2 = ac.createOscillator(); o2.type = 'sine'; o2.frequency.value = f * 2.003;
+    const g2 = ac.createGain(); g2.gain.value = 0.25;
+
+    const p = ac.createStereoPanner ? ac.createStereoPanner() : null;
+    o1.connect(filt); o2.connect(g2).connect(filt);
+    filt.connect(env);
+    const out = p ? (p.pan.value = pan * 0.8, env.connect(p), p) : env;
+    out.connect(dryBus); out.connect(delayIn);
+
+    o1.start(t); o2.start(t);
+    o1.stop(t + T.decay + 0.05); o2.stop(t + T.decay + 0.05);
+  }
+
+  // ---------- 画布 ----------
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * DPR; cv.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  addEventListener('resize', resize); resize();
+
+  const LIFE = 7000;          // 笔迹存活时间 (ms)
+  const MAX_SEGS = 5000;
+  let segs = [], parts = [], rings = [];
+  const bandOf = y => Math.max(0, Math.min(notes.length - 1, Math.floor((1 - y / H) * notes.length)));
+  const bandY = i => H - (i + 0.5) * (H / notes.length);
+
+  // ---------- 笔触逻辑 (实时与回放共用) ----------
+  const strokes = new Map();
+  let lastRingBand = -1, lastRingT = 0, flash = [];
+
+  function triggerNote(s, x, y, now, vel) {
+    const band = bandOf(y);
+    playNote(notes[band], vel, (x / W) * 2 - 1);
+    s.band = band; s.nx = x; s.ny = y; s.nt = now;
+    rings.push({ x, y, r: 4, born: now, hue: s.hue, vel });
+    flash[band] = now;
+    for (let i = 0; i < 10 + vel * 18; i++) {
+      const a = Math.random() * Math.PI * 2, sp = 0.4 + Math.random() * (1.2 + vel * 3);
+      parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, born: now, life: 600 + Math.random() * 900, hue: s.hue + (Math.random() * 40 - 20), size: 1 + Math.random() * 2 });
+    }
+  }
+
+  function strokeStart(id, x, y, now) {
+    const s = { x, y, t: now, speed: 0, hue: (200 + (x / W) * 140 + now * 0.01) % 360 };
+    strokes.set(id, s);
+    triggerNote(s, x, y, now, 0.5);
+  }
+
+  function strokeMove(id, x, y, now) {
+    const s = strokes.get(id);
+    if (!s) return;
+    const dx = x - s.x, dy = y - s.y, d = Math.hypot(dx, dy);
+    if (d < 1.5) return;
+    const dt = Math.max(1, now - s.t);
+    s.speed = s.speed * 0.7 + (d / dt) * 0.3;
+    const vel = Math.min(1, s.speed / 2.2);
+    s.hue = (s.hue + d * 0.08) % 360;
+
+    segs.push({ x1: s.x, y1: s.y, x2: x, y2: y, w: 1.5 + vel * 7, hue: s.hue, born: now, light: 55 + (1 - y / H) * 25 });
+    if (segs.length > MAX_SEGS) segs.splice(0, segs.length - MAX_SEGS);
+
+    if (Math.random() < 0.5 + vel) {
+      parts.push({ x, y, vx: (Math.random() - 0.5) * 0.8 - dx * 0.03, vy: (Math.random() - 0.5) * 0.8 - dy * 0.03, born: now, life: 500 + Math.random() * 700, hue: s.hue, size: 0.8 + Math.random() * 1.6 });
+    }
+
+    // 换了音区，或走了够远的距离，就再响一个音
+    const band = bandOf(y), sinceNote = Math.hypot(x - s.nx, y - s.ny);
+    if (now - s.nt > 70 && (band !== s.band || sinceNote > 90)) triggerNote(s, x, y, now, vel);
+
+    s.x = x; s.y = y; s.t = now;
+  }
+
+  function strokeEnd(id) { strokes.delete(id); }
+
+  // ---------- 录制与回放 ----------
+  let record = [], recStart = 0, recLast = 0;
+  let replaying = false, replayStart = 0, replayIdx = 0;
+
+  function rec(type, id, x, y, now) {
+    if (replaying) return;
+    if (!record.length) { recStart = now; recLast = 0; }
+    let t = now - recStart;
+    // 压缩笔画之间的长停顿
+    if (type === 'down' && t - recLast > 800) { recStart += (t - recLast) - 600; t = now - recStart; }
+    recLast = t;
+    record.push({ type, id, x: x / W, y: y / H, t });
+    replayBtn.disabled = false;
+  }
+
+  function startReplay() {
+    if (!record.length) return;
+    initAudio();
+    strokes.clear(); segs = []; parts = []; rings = [];
+    replaying = true; replayIdx = 0; replayStart = performance.now();
+    replayBtn.classList.add('on');
+  }
+  function stopReplay() {
+    replaying = false; strokes.clear();
+    replayBtn.classList.remove('on');
+  }
+  function stepReplay(now) {
+    const el = now - replayStart;
+    while (replayIdx < record.length && record[replayIdx].t <= el) {
+      const e = record[replayIdx++], x = e.x * W, y = e.y * H, t = replayStart + e.t;
+      const id = 'r' + e.id;
+      if (e.type === 'down') strokeStart(id, x, y, t);
+      else if (e.type === 'move') strokeMove(id, x, y, t);
+      else strokeEnd(id);
+    }
+    if (replayIdx >= record.length) stopReplay();
+  }
+
+  // ---------- 指针输入 ----------
+  const hint = document.getElementById('hint');
+  cv.addEventListener('pointerdown', e => {
+    initAudio();
+    if (replaying) stopReplay();
+    hint.classList.add('gone');
+    try { cv.setPointerCapture(e.pointerId); } catch {}
+    const now = performance.now();
+    strokeStart(e.pointerId, e.clientX, e.clientY, now);
+    rec('down', e.pointerId, e.clientX, e.clientY, now);
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!strokes.has(e.pointerId)) return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of evs) {
+      const now = performance.now();
+      strokeMove(e.pointerId, ev.clientX, ev.clientY, now);
+      rec('move', e.pointerId, ev.clientX, ev.clientY, now);
+    }
+  });
+  const up = e => {
+    if (!strokes.has(e.pointerId)) return;
+    strokeEnd(e.pointerId);
+    rec('up', e.pointerId, e.clientX, e.clientY, performance.now());
+  };
+  cv.addEventListener('pointerup', up);
+  cv.addEventListener('pointercancel', up);
+
+  // ---------- 渲染 ----------
+  function draw(now) {
+    if (replaying) stepReplay(now);
+    ctx.clearRect(0, 0, W, H);
+
+    // 音区参考线
+    const bh = H / notes.length;
+    ctx.font = '10px -apple-system, sans-serif';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i < notes.length; i++) {
+      const y = bandY(i), f = flash[i] ? Math.max(0, 1 - (now - flash[i]) / 600) : 0;
+      const isRoot = (notes[i] - ROOT) % 12 === 0;
+      if (f > 0) {
+        ctx.fillStyle = `rgba(157,140,255,${0.07 * f})`;
+        ctx.fillRect(0, y - bh / 2, W, bh);
+      }
+      ctx.fillStyle = `rgba(255,255,255,${(isRoot ? 0.06 : 0.025) + f * 0.12})`;
+      ctx.fillRect(28, Math.round(y), W - 28, 1);
+      ctx.fillStyle = `rgba(200,195,240,${0.22 + f * 0.6})`;
+      ctx.fillText(midiName(notes[i]), 4, y);
+    }
+
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+
+    // 笔迹：外层光晕 + 内层亮线
+    let keep = 0;
+    for (const s of segs) {
+      const age = now - s.born;
+      const a = frozen ? 1 : 1 - age / LIFE;
+      if (a <= 0) continue;
+      segs[keep++] = s;
+      const fresh = Math.max(0, 1 - age / 400);
+      ctx.strokeStyle = `hsla(${s.hue},90%,${s.light}%,${0.12 * a + 0.1 * fresh})`;
+      ctx.lineWidth = s.w * 3.2 + fresh * 6;
+      ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2); ctx.stroke();
+      ctx.strokeStyle = `hsla(${s.hue},100%,${Math.min(92, s.light + 15 + fresh * 20)}%,${0.85 * a})`;
+      ctx.lineWidth = s.w * 0.6;
+      ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2); ctx.stroke();
+    }
+    segs.length = keep;
+
+    // 涟漪
+    rings = rings.filter(r => {
+      const k = (now - r.born) / 1100;
+      if (k >= 1) return false;
+      const rad = 4 + k * (40 + r.vel * 70);
+      ctx.strokeStyle = `hsla(${r.hue},100%,75%,${(1 - k) * 0.6})`;
+      ctx.lineWidth = 1.5 * (1 - k) + 0.5;
+      ctx.beginPath(); ctx.arc(r.x, r.y, rad, 0, Math.PI * 2); ctx.stroke();
+      return true;
+    });
+
+    // 沙粒
+    parts = parts.filter(p => {
+      const k = (now - p.born) / p.life;
+      if (k >= 1) return false;
+      p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy = p.vy * 0.96 + 0.015;
+      ctx.fillStyle = `hsla(${p.hue},100%,75%,${1 - k})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (1 - k * 0.5), 0, Math.PI * 2); ctx.fill();
+      return true;
+    });
+    if (parts.length > 3000) parts.splice(0, parts.length - 3000);
+
+    ctx.globalCompositeOperation = 'source-over';
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+
+  // ---------- 控制栏 ----------
+  const scalesEl = document.getElementById('scales'), timbresEl = document.getElementById('timbres');
+  const replayBtn = document.getElementById('replay'), freezeBtn = document.getElementById('freeze');
+  const muteBtn = document.getElementById('mute');
+  replayBtn.disabled = true;
+
+  function makeGroup(el, list, getIdx, setIdx, keyOffset) {
+    list.forEach((item, i) => {
+      const b = document.createElement('button');
+      b.innerHTML = item.name + (keyOffset != null ? `<kbd>${i + keyOffset}</kbd>` : '');
+      b.onclick = () => { setIdx(i); refresh(); };
+      el.appendChild(b);
+    });
+    const refresh = () => [...el.children].forEach((b, i) => b.classList.toggle('on', i === getIdx()));
+    refresh();
+    return refresh;
+  }
+  const refreshScales = makeGroup(scalesEl, SCALES, () => scaleIdx, i => { scaleIdx = i; buildNotes(); }, 1);
+  makeGroup(timbresEl, TIMBRES, () => timbreIdx, i => { timbreIdx = i; });
+
+  function toggleFreeze() {
+    frozen = !frozen;
+    if (!frozen) { const now = performance.now(); segs.forEach(s => s.born = now); }
+    freezeBtn.classList.toggle('on', frozen);
+  }
+  function clearAll() {
+    stopReplay(); segs = []; parts = []; rings = []; record = [];
+    replayBtn.disabled = true;
+  }
+  function toggleMute() {
+    muted = !muted;
+    if (master) master.gain.setTargetAtTime(muted ? 0 : 0.7, ac.currentTime, 0.03);
+    muteBtn.classList.toggle('on', muted);
+  }
+  freezeBtn.onclick = toggleFreeze;
+  replayBtn.onclick = () => replaying ? stopReplay() : startReplay();
+  document.getElementById('clear').onclick = clearAll;
+  muteBtn.onclick = toggleMute;
+
+  // 按钮不抢焦点，避免空格键既触发快捷键又“点击”按钮
+  document.querySelector('.bar').addEventListener('mousedown', e => e.preventDefault());
+
+  addEventListener('keydown', e => {
+    if (e.metaKey || e.ctrlKey) return;
+    const k = e.key.toLowerCase();
+    if (k === ' ') { e.preventDefault(); replaying ? stopReplay() : startReplay(); }
+    else if (k === 'c') clearAll();
+    else if (k === 'm') toggleMute();
+    else if (k === 'f') toggleFreeze();
+    else if (k >= '1' && k <= String(SCALES.length)) { scaleIdx = +k - 1; buildNotes(); refreshScales(); }
+  });
+})();
+</script>
+</body>
+</html>
